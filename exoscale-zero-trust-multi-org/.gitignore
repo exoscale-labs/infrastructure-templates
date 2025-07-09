@@ -1,0 +1,27 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Terraform files
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+tfplan
+*.tfvars
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
+
+# Connection info
+connection-info.txt
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

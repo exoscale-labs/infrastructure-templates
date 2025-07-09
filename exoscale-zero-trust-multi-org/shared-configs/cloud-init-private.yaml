@@ -1,0 +1,91 @@
+#cloud-config
+# Production private instance configuration
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - wget
+  - net-tools
+  - htop
+  - vim
+  - traceroute
+  - dnsutils
+
+# Configure network interface
+write_files:
+  - content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          eth0:
+            dhcp4: true
+            dhcp4-overrides:
+              use-routes: true
+              use-dns: true
+            nameservers:
+              addresses: [1.1.1.1, 8.8.8.8]
+    path: /etc/netplan/01-private-config.yaml
+    owner: root:root
+    permissions: '0644'
+
+  - content: |
+      #!/bin/bash
+      # Production private instance setup
+      
+      # Apply network configuration
+      netplan apply
+      
+      # Configure SSH
+      sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+      sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+      systemctl restart sshd
+      
+      # Set up firewall
+      ufw --force reset
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow from ${router_ip} to any port 22 proto tcp
+      ufw allow from ${router_ip}/24
+      ufw --force enable
+      
+      # Add route to FortiGate tunnel network for direct SSH access
+      echo "Adding route to FortiGate tunnel network..." >> /var/log/private-instance-setup.log
+      ip route add 192.168.100.0/24 via ${router_ip} dev eth0
+      
+      # Test connectivity
+      ping -c 3 ${router_ip} >> /var/log/private-instance-setup.log 2>&1
+      
+      echo "Production private instance setup completed at $(date)" >> /var/log/private-instance-setup.log
+    path: /opt/private-instance-setup.sh
+    owner: root:root
+    permissions: '0755'
+
+# Run setup commands
+runcmd:
+  - /opt/private-instance-setup.sh
+
+# Set timezone
+timezone: Europe/Zurich
+
+# Add user for management
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+# Final message
+final_message: |
+  Production private instance setup completed!
+  
+  Configuration:
+  - Network: Private only (eth0)
+  - Router IP: ${router_ip}
+  - Internet: Through router → FortiGate
+  - SSH: Only from router
+  
+  Access: SSH to router first, then to this instance

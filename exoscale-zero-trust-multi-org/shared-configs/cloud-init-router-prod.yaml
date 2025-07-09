@@ -1,0 +1,352 @@
+#cloud-config
+# Production router that blocks direct internet access
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - isc-dhcp-server
+  - wireguard
+  - wireguard-tools
+  - iptables-persistent
+  - ufw
+  - net-tools
+  - curl
+  - wget
+  - netcat-openbsd
+
+# Enable IP forwarding
+write_files:
+  - content: |
+      net.ipv4.ip_forward=1
+      net.ipv6.conf.all.forwarding=1
+    path: /etc/sysctl.d/99-router.conf
+    owner: root:root
+    permissions: '0644'
+
+  - content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          eth0:
+            dhcp4: true
+            dhcp4-overrides:
+              use-routes: true  # Allow routes initially
+            dhcp6-overrides:
+              use-routes: true  # Match dhcp4 setting
+          eth1:
+            addresses:
+              - ${private_ip}/24
+            dhcp4: false
+    path: /etc/netplan/01-router-config.yaml
+    owner: root:root
+    permissions: '0600'
+
+  - content: |
+      # DHCP Server Configuration
+      default-lease-time 600;
+      max-lease-time 7200;
+      authoritative;
+
+      subnet ${cidrhost(private_network, 0)} netmask 255.255.255.0 {
+          range ${dhcp_range_start} ${dhcp_range_end};
+          option routers ${private_ip};
+          option domain-name-servers 1.1.1.1, 8.8.8.8;
+          option broadcast-address ${cidrhost(private_network, 255)};
+      }
+    path: /etc/dhcp/dhcpd.conf
+    owner: root:root
+    permissions: '0644'
+
+  - content: |
+      INTERFACESv4="eth1"
+    path: /etc/default/isc-dhcp-server
+    owner: root:root
+    permissions: '0644'
+
+  - content: |
+      [Interface]
+      Address = ${wg_tunnel_ip}
+      PrivateKey = PRIVATE_KEY_PLACEHOLDER
+      ListenPort = 51820
+
+      [Peer]
+      PublicKey = FORTIGATE_PUBLIC_KEY_PLACEHOLDER
+      Endpoint = ${fortigate_ip}:51820
+      AllowedIPs = 0.0.0.0/0
+      PersistentKeepalive = 25
+    path: /etc/wireguard/wg0.conf.template
+    owner: root:root
+    permissions: '0600'
+
+  # Shared SSH key for inter-instance communication
+  - content: ${shared_ssh_private_key}
+    path: /root/.ssh/shared_key
+    owner: root:root
+    permissions: '0600'
+
+  - content: |
+      #!/bin/bash
+      set -x
+      exec >> /var/log/test-router-setup.log 2>&1
+      
+      # Enhanced debugging router setup
+      echo "=== ROUTER SETUP DEBUG LOG ==="
+      echo "Starting router setup at $(date)"
+      echo "Router IP: $(hostname -I)"
+      echo "FortiGate IP: ${fortigate_ip}"
+      
+      # Function for debug logging
+      debug_log() {
+        echo "[DEBUG $(date '+%H:%M:%S')] $1"
+      }
+      
+      error_exit() {
+        echo "[ERROR $(date '+%H:%M:%S')] $1"
+        echo "=== SETUP FAILED ==="
+        exit 1
+      }
+      
+      # Wait for FortiGate to be ready
+      debug_log "Waiting for FortiGate..."
+      sleep 60
+      
+      # Test network connectivity to FortiGate
+      debug_log "Testing network connectivity to FortiGate..."
+      if nc -zv ${fortigate_ip} 22 >/dev/null 2>&1; then
+        debug_log "FortiGate ${fortigate_ip} is reachable via SSH"
+      else
+        debug_log "FortiGate ${fortigate_ip} is not reachable via SSH (expected for production)"
+      fi
+      
+      # Check if shared SSH key exists
+      debug_log "Checking shared SSH key..."
+      if [ -f /root/.ssh/shared_key ]; then
+        debug_log "Shared SSH key found"
+        ls -la /root/.ssh/shared_key
+      else
+        error_exit "Shared SSH key not found at /root/.ssh/shared_key"
+      fi
+      
+      # Generate Wireguard keys
+      debug_log "Generating Wireguard keys..."
+      umask 077
+      wg genkey | tee /etc/wireguard/private.key | wg pubkey > /etc/wireguard/public.key
+      chmod 600 /etc/wireguard/private.key
+      chmod 644 /etc/wireguard/public.key
+      
+      PRIVATE_KEY=$(cat /etc/wireguard/private.key)
+      PUBLIC_KEY=$(cat /etc/wireguard/public.key)
+      
+      debug_log "Generated Wireguard keys:"
+      debug_log "Public key: $PUBLIC_KEY"
+      debug_log "Private key: [REDACTED]"
+      
+      # For production, FortiGate public key must be provided manually
+      debug_log "Production mode - FortiGate public key must be configured manually on FortiGate"
+      # In production, the FortiGate admin will configure the peer manually
+      # We'll generate our key and display it for manual configuration
+      FORTIGATE_PUBLIC_KEY="MANUAL_CONFIG_REQUIRED"
+      
+      # Create Wireguard config from template
+      debug_log "Creating Wireguard configuration..."
+      sed "s|PRIVATE_KEY_PLACEHOLDER|$PRIVATE_KEY|g" /etc/wireguard/wg0.conf.template > /etc/wireguard/wg0.conf
+      sed -i "s|FORTIGATE_PUBLIC_KEY_PLACEHOLDER|$FORTIGATE_PUBLIC_KEY|g" /etc/wireguard/wg0.conf
+      chmod 600 /etc/wireguard/wg0.conf
+      
+      debug_log "Wireguard configuration created:"
+      cat /etc/wireguard/wg0.conf
+      
+      # Production note: FortiGate peer configuration must be done manually
+      debug_log "=== FORTIGATE CONFIGURATION REQUIRED ==="
+      debug_log "Router Public Key: $PUBLIC_KEY"
+      debug_log "Configure this peer on FortiGate with:"
+      debug_log "- Public Key: $PUBLIC_KEY"
+      debug_log "- Allowed IPs: ${wg_tunnel_ip}, ${private_network}"
+      debug_log "- Endpoint: This router's public IP:51820"
+      debug_log "========================================="
+      
+      # Apply network config first
+      debug_log "Applying network configuration..."
+      netplan apply
+      sysctl -p /etc/sysctl.d/99-router.conf
+      
+      # Start Wireguard with detailed debugging
+      debug_log "Starting Wireguard interface..."
+      systemctl enable wg-quick@wg0
+      
+      debug_log "Wireguard config before start:"
+      cat /etc/wireguard/wg0.conf
+      
+      if systemctl start wg-quick@wg0; then
+        debug_log "Wireguard started successfully"
+        debug_log "Wireguard interface status:"
+        wg show
+        debug_log "Interface details:"
+        ip addr show wg0
+        debug_log "Wireguard systemctl status:"
+        systemctl status wg-quick@wg0 --no-pager
+      else
+        debug_log "Failed to start Wireguard, checking logs..."
+        journalctl -u wg-quick@wg0 --no-pager -n 20
+        error_exit "Failed to start Wireguard interface"
+      fi
+      
+      # Test tunnel connectivity
+      debug_log "Testing tunnel connectivity to FortiGate..."
+      sleep 10
+      if ping -c 3 ${wg_fortigate_ip} >/dev/null 2>&1; then
+        debug_log "Tunnel connectivity to FortiGate successful"
+      else
+        debug_log "Tunnel connectivity not established yet (FortiGate peer may need manual configuration)"
+        debug_log "Current routes:"
+        ip route show
+        debug_log "Wireguard peer status:"
+        wg show all
+        debug_log "Interface status:"
+        ip addr show
+        debug_log "Continuing setup - tunnel will work once FortiGate peer is configured"
+      fi
+      
+      # Default route will be configured later after firewall setup
+      
+      # Configure firewall - keep SSH open, block direct internet
+      debug_log "Configuring firewall rules..."
+      iptables -F
+      iptables -P INPUT ACCEPT
+      iptables -P OUTPUT ACCEPT
+      iptables -P FORWARD DROP
+      
+      # Allow SSH access
+      iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+      iptables -A OUTPUT -p tcp --sport 22 -j ACCEPT
+      
+      # Allow loopback
+      iptables -A INPUT -i lo -j ACCEPT
+      iptables -A OUTPUT -o lo -j ACCEPT
+      
+      # Allow established connections
+      iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      
+      # Allow DHCP
+      iptables -A INPUT -p udp --dport 67 -j ACCEPT
+      iptables -A OUTPUT -p udp --sport 67 -j ACCEPT
+      
+      # Allow Wireguard
+      iptables -A INPUT -p udp --dport 51820 -j ACCEPT
+      iptables -A OUTPUT -p udp --sport 51820 -j ACCEPT
+      
+      # Allow forwarding through Wireguard
+      iptables -A FORWARD -i eth1 -o wg0 -j ACCEPT
+      iptables -A FORWARD -i wg0 -o eth1 -j ACCEPT
+      iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+      
+      # Block direct internet from router (except SSH/Wireguard)
+      iptables -A OUTPUT -o eth0 -p tcp --dport 22 -j ACCEPT
+      iptables -A OUTPUT -o eth0 -p udp --dport 51820 -j ACCEPT
+      iptables -A OUTPUT -o eth0 -p tcp --dport 53 -j ACCEPT
+      iptables -A OUTPUT -o eth0 -p udp --dport 53 -j ACCEPT
+      iptables -A OUTPUT -o eth0 -j DROP
+      
+      # Save rules
+      iptables-save > /etc/iptables/rules.v4
+      
+      # Configure firewall
+      ufw --force reset
+      ufw allow ssh
+      ufw allow 51820/udp
+      ufw allow 67/udp
+      ufw --force enable
+      
+      # Configure policy-based routing (PRESERVE DEFAULT ROUTE)
+      debug_log "Configuring policy-based routing for internet via tunnel..."
+      
+      # Create a custom routing table for tunnel traffic
+      echo "100 tunnel" >> /etc/iproute2/rt_tables || true
+      
+      # Add tunnel routes to custom table (NOT default table)
+      ip route add default dev wg0 table tunnel || true
+      ip route add 192.168.100.0/30 dev wg0 table tunnel || true
+      
+      # Use iptables to mark packets that should go through tunnel
+      # Mark all traffic from private network for tunnel routing
+      iptables -t mangle -A PREROUTING -s 10.0.0.0/24 -j MARK --set-mark 100
+      iptables -t mangle -A OUTPUT -s 10.0.0.0/24 -j MARK --set-mark 100
+      
+      # Route marked packets via tunnel table
+      ip rule add fwmark 100 table tunnel || true
+      
+      debug_log "Policy-based routing configured - SSH preserved, private traffic via tunnel"
+      
+      # Final connectivity tests
+      debug_log "Running final connectivity tests..."
+      
+      # Test direct internet (should fail)
+      debug_log "Testing direct internet access (should fail)..."
+      if ping -c 3 8.8.8.8 >/dev/null 2>&1; then
+        debug_log "WARNING: Direct internet access works - this should not happen!"
+      else
+        debug_log "Direct internet access blocked as expected"
+      fi
+      
+      # Test internet through tunnel
+      debug_log "Testing internet through tunnel..."
+      if curl -s --max-time 10 https://httpbin.org/ip >/dev/null 2>&1; then
+        debug_log "Internet access through tunnel successful"
+      else
+        debug_log "Internet access through tunnel failed"
+      fi
+      
+      # Log final status
+      debug_log "=== FINAL SETUP STATUS ==="
+      debug_log "Wireguard status:"
+      wg show
+      debug_log "Routes:"
+      ip route show
+      debug_log "Interfaces:"
+      ip addr show
+      debug_log "Firewall rules:"
+      iptables -L -n
+      debug_log "NAT rules:"
+      iptables -t nat -L -n
+      
+      echo "=== ROUTER SETUP COMPLETED SUCCESSFULLY ==="
+      echo "Public Key: $PUBLIC_KEY"
+      echo "Setup completed at $(date)"
+    path: /opt/production-router-setup.sh
+    owner: root:root
+    permissions: '0755'
+
+# Run setup commands
+runcmd:
+  - chmod +x /opt/production-router-setup.sh
+  - /opt/production-router-setup.sh
+  - systemctl enable isc-dhcp-server
+  - systemctl start isc-dhcp-server
+
+# Set timezone
+timezone: Europe/Zurich
+
+# Add user for management
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+      - ${shared_ssh_public_key}
+
+# Final message
+final_message: |
+  Production router setup completed!
+  
+  IMPORTANT: This router has NO direct internet access!
+  
+  Configuration:
+  - Router IP: ${private_ip}
+  - FortiGate Sim: ${fortigate_sim_ip}
+  - Internet: BLOCKED (only through FortiGate after config)
+  
+  Get public key: sudo cat /etc/wireguard/public.key

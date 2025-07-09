@@ -1,0 +1,104 @@
+#cloud-config
+# Ultra-minimal private instance configuration for testing
+
+package_update: false
+package_upgrade: false
+
+packages:
+  - openssh-server
+
+write_files:
+  - content: |
+      #!/bin/bash
+      set -x
+      exec > /var/log/minimal-setup.log 2>&1
+      
+      echo "=== Minimal setup started at $(date) ==="
+      
+      # Wait for network
+      sleep 20
+      
+      # Configure network with DHCP
+      cat > /etc/netplan/99-private.yaml << 'EOF'
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          eth0:
+            dhcp4: true
+            dhcp4-overrides:
+              use-routes: true
+              use-dns: true
+              use-gateway: true
+            nameservers:
+              addresses: [8.8.8.8, 1.1.1.1]
+      EOF
+      
+      # Apply network config
+      netplan apply
+      
+      # Wait for network to come up
+      sleep 20
+      
+      # Show network status
+      ip addr show
+      ip route show
+      
+      # Ensure default route is set (fallback)
+      if ! ip route show | grep -q "default"; then
+        echo "Adding default route manually..."
+        ip route add default via 10.0.0.1 dev eth0
+      fi
+      
+      # Add route to FortiGate tunnel network for direct SSH access
+      echo "Adding route to FortiGate tunnel network..."
+      ip route add 192.168.100.0/24 via 10.0.0.1 dev eth0
+      
+      # Completely disable all firewalls
+      systemctl stop ufw || true
+      systemctl disable ufw || true
+      ufw --force reset || true
+      
+      iptables -F
+      iptables -X
+      iptables -t nat -F
+      iptables -t nat -X
+      iptables -t mangle -F
+      iptables -t mangle -X
+      iptables -P INPUT ACCEPT
+      iptables -P FORWARD ACCEPT
+      iptables -P OUTPUT ACCEPT
+      
+      # Start SSH service
+      systemctl enable ssh
+      systemctl start ssh
+      
+      # Test connectivity
+      ping -c 3 10.0.0.1
+      
+      echo "=== Minimal setup completed at $(date) ==="
+    path: /opt/minimal-setup.sh
+    owner: root:root
+    permissions: '0755'
+
+runcmd:
+  - /opt/minimal-setup.sh
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+      - ${shared_ssh_public_key}
+  - name: root
+    lock_passwd: false
+    passwd: $6$rounds=4096$saltsalt$3xzZ8fNlYhJqRn7Z9pYGJmFJoGJlZdqzXdKvnZQpOgM.sQjOEQo4MgJPNxFbLJLjgxjHZjXkBcNmQvT9qnLjL/
+
+# Set root password
+chpasswd:
+  list: |
+    root:denis123
+  expire: false
+
+final_message: "Minimal private instance ready"

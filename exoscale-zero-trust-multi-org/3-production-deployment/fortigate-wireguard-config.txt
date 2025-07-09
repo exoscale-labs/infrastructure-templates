@@ -1,0 +1,327 @@
+# FortiGate Wireguard Configuration for Multi-Organization Zero Trust Architecture
+
+# ==========================================
+# ER1 ORGANIZATION CONFIGURATION
+# ==========================================
+
+# 1. Create Wireguard interface for ER1
+config system interface
+    edit "wg-to-er1"
+        set type tunnel
+        set tunnel-type wireguard
+        set interface "wan1"
+        set ip 192.168.100.1/30
+        set allowaccess ping ssh
+        set mtu-override enable
+        set mtu 1420
+    next
+end
+
+# 2. Configure Wireguard peer for ER1
+config vpn wireguard
+    edit "wg-to-er1"
+        set interface "wg-to-er1"
+        set port 51820
+        set private-key "FORTIGATE_PRIVATE_KEY_HERE"
+        config peer
+            edit 1
+                set public-key "ER1_ROUTER_PUBLIC_KEY_HERE"
+                set endpoint "ER1_ROUTER_PUBLIC_IP:51820"
+                set allowed-ips 10.18.11.0/24
+                set persistent-keepalive 25
+            next
+        end
+    next
+end
+
+# 3. Static route for ER1 private network
+config router static
+    edit 1
+        set dst 10.18.11.0/24
+        set gateway 192.168.100.2
+        set device "wg-to-er1"
+        set status enable
+    next
+end
+
+# ==========================================
+# ER2 ORGANIZATION CONFIGURATION
+# ==========================================
+
+# 4. Create Wireguard interface for ER2
+config system interface
+    edit "wg-to-er2"
+        set type tunnel
+        set tunnel-type wireguard
+        set interface "wan1"
+        set ip 192.168.101.1/30
+        set allowaccess ping ssh
+        set mtu-override enable
+        set mtu 1420
+    next
+end
+
+# 5. Configure Wireguard peer for ER2
+config vpn wireguard
+    edit "wg-to-er2"
+        set interface "wg-to-er2"
+        set port 51821
+        set private-key "FORTIGATE_PRIVATE_KEY_HERE"
+        config peer
+            edit 1
+                set public-key "ER2_ROUTER_PUBLIC_KEY_HERE"
+                set endpoint "ER2_ROUTER_PUBLIC_IP:51820"
+                set allowed-ips 10.18.21.0/24
+                set persistent-keepalive 25
+            next
+        end
+    next
+end
+
+# 6. Static route for ER2 private network
+config router static
+    edit 2
+        set dst 10.18.21.0/24
+        set gateway 192.168.101.2
+        set device "wg-to-er2"
+        set status enable
+    next
+end
+
+# ==========================================
+# ER3 ORGANIZATION CONFIGURATION
+# ==========================================
+
+# 7. Create Wireguard interface for ER3
+config system interface
+    edit "wg-to-er3"
+        set type tunnel
+        set tunnel-type wireguard
+        set interface "wan1"
+        set ip 192.168.102.1/30
+        set allowaccess ping ssh
+        set mtu-override enable
+        set mtu 1420
+    next
+end
+
+# 8. Configure Wireguard peer for ER3
+config vpn wireguard
+    edit "wg-to-er3"
+        set interface "wg-to-er3"
+        set port 51822
+        set private-key "FORTIGATE_PRIVATE_KEY_HERE"
+        config peer
+            edit 1
+                set public-key "ER3_ROUTER_PUBLIC_KEY_HERE"
+                set endpoint "ER3_ROUTER_PUBLIC_IP:51820"
+                set allowed-ips 10.18.31.0/24
+                set persistent-keepalive 25
+            next
+        end
+    next
+end
+
+# 9. Static route for ER3 private network
+config router static
+    edit 3
+        set dst 10.18.31.0/24
+        set gateway 192.168.102.2
+        set device "wg-to-er3"
+        set status enable
+    next
+end
+
+# ==========================================
+# ZERO TRUST FIREWALL POLICIES
+# ==========================================
+
+# 10. Zero Trust policy: Organizations to Internet (monitored)
+config firewall policy
+    edit 10
+        set name "ER1-to-Internet"
+        set srcintf "wg-to-er1"
+        set dstintf "wan1"
+        set srcaddr "ER1-Network"
+        set dstaddr "all"
+        set action accept
+        set schedule "always"
+        set service "ALL"
+        set nat enable
+        set logtraffic all
+        set comments "Zero Trust: ER1 internet access via FortiGate"
+    next
+    edit 11
+        set name "ER2-to-Internet"
+        set srcintf "wg-to-er2"
+        set dstintf "wan1"
+        set srcaddr "ER2-Network"
+        set dstaddr "all"
+        set action accept
+        set schedule "always"
+        set service "ALL"
+        set nat enable
+        set logtraffic all
+        set comments "Zero Trust: ER2 internet access via FortiGate"
+    next
+    edit 12
+        set name "ER3-to-Internet"
+        set srcintf "wg-to-er3"
+        set dstintf "wan1"
+        set srcaddr "ER3-Network"
+        set dstaddr "all"
+        set action accept
+        set schedule "always"
+        set service "ALL"
+        set nat enable
+        set logtraffic all
+        set comments "Zero Trust: ER3 internet access via FortiGate"
+    next
+end
+
+# 11. Zero Trust policy: FortiGate management access to private instances
+config firewall policy
+    edit 20
+        set name "FortiGate-to-ER1-Management"
+        set srcintf "wan1"
+        set dstintf "wg-to-er1"
+        set srcaddr "all"
+        set dstaddr "ER1-Network"
+        set action accept
+        set schedule "always"
+        set service "SSH" "PING"
+        set logtraffic all
+        set comments "Zero Trust: FortiGate can manage ER1 instances"
+    next
+    edit 21
+        set name "FortiGate-to-ER2-Management"
+        set srcintf "wan1"
+        set dstintf "wg-to-er2"
+        set srcaddr "all"
+        set dstaddr "ER2-Network"
+        set action accept
+        set schedule "always"
+        set service "SSH" "PING"
+        set logtraffic all
+        set comments "Zero Trust: FortiGate can manage ER2 instances"
+    next
+    edit 22
+        set name "FortiGate-to-ER3-Management"
+        set srcintf "wan1"
+        set dstintf "wg-to-er3"
+        set srcaddr "all"
+        set dstaddr "ER3-Network"
+        set action accept
+        set schedule "always"
+        set service "SSH" "PING"
+        set logtraffic all
+        set comments "Zero Trust: FortiGate can manage ER3 instances"
+    next
+end
+
+# 12. Zero Trust isolation: Block inter-organization communication
+config firewall policy
+    edit 30
+        set name "Block-ER1-to-ER2"
+        set srcintf "wg-to-er1"
+        set dstintf "wg-to-er2"
+        set srcaddr "ER1-Network"
+        set dstaddr "ER2-Network"
+        set action deny
+        set schedule "always"
+        set service "ALL"
+        set logtraffic all
+        set comments "Zero Trust: Block ER1 → ER2 communication"
+    next
+    edit 31
+        set name "Block-ER1-to-ER3"
+        set srcintf "wg-to-er1"
+        set dstintf "wg-to-er3"
+        set srcaddr "ER1-Network"
+        set dstaddr "ER3-Network"
+        set action deny
+        set schedule "always"
+        set service "ALL"
+        set logtraffic all
+        set comments "Zero Trust: Block ER1 → ER3 communication"
+    next
+    edit 32
+        set name "Block-ER2-to-ER3"
+        set srcintf "wg-to-er2"
+        set dstintf "wg-to-er3"
+        set srcaddr "ER2-Network"
+        set dstaddr "ER3-Network"
+        set action deny
+        set schedule "always"
+        set service "ALL"
+        set logtraffic all
+        set comments "Zero Trust: Block ER2 → ER3 communication"
+    next
+end
+
+# ==========================================
+# NETWORK ADDRESS OBJECTS
+# ==========================================
+
+# 13. Address objects for organization networks
+config firewall address
+    edit "ER1-Network"
+        set subnet 10.18.11.0/24
+        set comment "ER1 Organization Private Network"
+    next
+    edit "ER2-Network"
+        set subnet 10.18.21.0/24
+        set comment "ER2 Organization Private Network"
+    next
+    edit "ER3-Network"
+        set subnet 10.18.31.0/24
+        set comment "ER3 Organization Private Network"
+    next
+    edit "All-Organizations"
+        set type group
+        set member "ER1-Network" "ER2-Network" "ER3-Network"
+        set comment "All organization networks for Zero Trust monitoring"
+    next
+end
+
+# ==========================================
+# DEPLOYMENT NOTES
+# ==========================================
+
+# Key Replacements Required:
+# - FORTIGATE_PRIVATE_KEY_HERE: FortiGate's Wireguard private key
+# - ER1_ROUTER_PUBLIC_KEY_HERE: ER1 router VM's public key  
+# - ER1_ROUTER_PUBLIC_IP: ER1 router VM's public IP
+# - ER2_ROUTER_PUBLIC_KEY_HERE: ER2 router VM's public key
+# - ER2_ROUTER_PUBLIC_IP: ER2 router VM's public IP  
+# - ER3_ROUTER_PUBLIC_KEY_HERE: ER3 router VM's public key
+# - ER3_ROUTER_PUBLIC_IP: ER3 router VM's public IP
+
+# Zero Trust Architecture Features:
+# ✅ Multi-organization support (ER1, ER2, ER3)
+# ✅ Isolated tunnel networks (192.168.100.x, 192.168.101.x, 192.168.102.x)
+# ✅ Centralized internet access monitoring
+# ✅ FortiGate management access to all private instances
+# ✅ Inter-organization isolation (organizations cannot access each other)
+# ✅ Complete traffic logging and monitoring
+# ✅ Different Wireguard ports for organization separation
+
+# Network Architecture Summary:
+# Organization | Private Network | Tunnel Network    | FortiGate Port
+# ER1         | 10.18.11.0/24   | 192.168.100.0/30 | 51820
+# ER2         | 10.18.21.0/24   | 192.168.101.0/30 | 51821  
+# ER3         | 10.18.31.0/24   | 192.168.102.0/30 | 51822
+
+# Security Policy Overview:
+# 1. Organizations can access internet (monitored via FortiGate NAT)
+# 2. FortiGate can manage all private instances (SSH/ping)
+# 3. Organizations are isolated from each other (deny policies)
+# 4. All traffic is logged for security monitoring
+# 5. No direct router-to-private access (Zero Trust feature)
+
+# Production Deployment:
+# - Adjust policy numbers to avoid conflicts with existing policies
+# - Consider implementing time-based access restrictions
+# - Add geo-blocking policies if required
+# - Configure IPS/antivirus scanning for additional security
+# - Set up logging to SIEM for comprehensive monitoring

@@ -81,20 +81,6 @@ ssh -J ubuntu@<fortigate-ip> ubuntu@<router-ip> "ping <private-ip>"
 | ER2 | 10.18.21.0/24 | 10.18.21.1 | 192.168.101.2/30 |
 | ER3 | 10.18.31.0/24 | 10.18.31.1 | 192.168.102.2/30 |
 
-## ⚡ Performance
-
-- **Private Instance Boot**: 2-3 minutes (70% faster than previous)
-- **Tunnel Latency**: Sub-millisecond FortiGate ↔ Private
-- **DHCP Assignment**: Instant IP allocation
-
-## 🛠️ Common Issues
-
-**DHCP Server Not Starting**: Fixed netplan dhcp4/dhcp6 consistency  
-**FortiGate SSH Timeout**: Fixed router forwarding rules  
-**Private Response Timeout**: Added tunnel routing
-
-All fixes are included in current configs.
-
 ## 🧹 Clean Up
 
 ```bash
@@ -123,10 +109,7 @@ FORTIGATE_PUBLIC_IP=your-fortigate-ip
 ✅ FortiGate can SSH to private instances  
 ✅ Router cannot access private instances (Zero Trust)  
 ✅ Private instances have internet via FortiGate  
-✅ Fast 2-3 minute deployment times  
 
 ---
 
 > **Note**: Router-to-private-instance isolation is an intentional Zero Trust security feature.
-
-Ready to deploy secure, scalable multi-organization networks! 🚀

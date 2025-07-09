@@ -84,35 +84,8 @@ This architecture provides a **Zero Trust** security model for multi-organizatio
 
 > **Important**: Router-to-private-instance connectivity is **intentionally blocked** for security. This is not a bug - it's a Zero Trust feature.
 
-## 📊 Technical Optimizations
-
-### **Cloud-Init Performance**
-- **Previous**: 8-10 minutes (complex hardening)
-- **Current**: 2-3 minutes (minimal essential setup)
-- **Improvement**: 70% faster deployment
-
-### **Configuration Types**
-- **Test Environment**: `cloud-init-private-minimal-test.yaml` (ultra-fast)
-- **Production Environment**: `cloud-init-private.yaml` (secure + fast)
 
 ## 🔧 Technical Implementation
-
-### **Network Engineering Solutions**
-
-#### **1. DHCP Server Reliability**
-- **Issue**: Netplan configuration error causing DHCP server failure
-- **Solution**: Fixed dhcp4/dhcp6 overrides consistency in router configs
-- **Result**: Reliable DHCP service startup and IP assignment
-
-#### **2. FortiGate SSH Access**
-- **Issue**: Router blocking NEW connections from FortiGate to private instances
-- **Solution**: Added `iptables -A FORWARD -i wg0 -o eth1 -j ACCEPT` rule
-- **Result**: FortiGate can now SSH directly to private instances
-
-#### **3. Symmetric Routing**
-- **Issue**: Packet path asymmetry causing connection timeouts
-- **Solution**: Added route `192.168.100.0/24 via 10.0.0.1` on private instances
-- **Result**: Proper bidirectional communication between FortiGate and private instances
 
 ### **Router VM Configuration**
 

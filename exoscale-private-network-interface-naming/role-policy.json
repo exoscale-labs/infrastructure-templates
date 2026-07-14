@@ -1,0 +1,11 @@
+{
+  "default-service-strategy": "deny",
+  "services": {
+    "compute": {
+      "type": "rules",
+      "rules": [
+        { "action": "allow", "expression": "operation in ['get-instance']" }
+      ]
+    }
+  }
+}

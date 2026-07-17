@@ -1,0 +1,180 @@
+#cloud-config
+# Deterministic private-network interface naming on Exoscale (RHEL/NetworkManager).
+# Fill in the scoped API key/secret and your private-network UUIDs below.
+write_files:
+  - path: /etc/privnet-namer/config.json
+    permissions: '0600'
+    content: |
+      {
+        "api_key": "EXO_SCOPED_KEY_HERE",
+        "api_secret": "SCOPED_SECRET_HERE",
+        "zone": "de-fra-1",
+        "networks": [
+          { "id": "PRIVNET_A_UUID", "name": "oam",  "cidr": "10.0.10.5/24" },
+          { "id": "PRIVNET_B_UUID", "name": "mgmt", "cidr": "10.0.20.5/24" }
+        ]
+      }
+  - path: /usr/local/bin/privnet-namer.py
+    permissions: '0755'
+    content: |
+      #!/usr/libexec/platform-python
+      """
+      privnet-namer (RHEL/NetworkManager variant).
+      
+      Same idea as the netplan version: ask the Exoscale API which MAC belongs to
+      which private network, then pin each network to a stable interface name and IP
+      by matching on MAC -- so kernel enumeration order stops mattering.
+      
+      RHEL 8/9 differences handled here:
+        - runs on /usr/libexec/platform-python (no python3 on a base RHEL image)
+        - uses NetworkManager (nmcli) instead of netplan
+        - writes a systemd.link file so the rename survives future reboots, and
+          renames the live device for the current boot
+      
+      No extra packages required (works on an unsubscribed BYOL image).
+      Config: /etc/privnet-namer/config.json
+      """
+      import base64, hashlib, hmac, json, os, subprocess, time, urllib.request
+      
+      CONFIG = os.environ.get("PRIVNET_NAMER_CONFIG", "/etc/privnet-namer/config.json")
+      LINK_DIR = "/etc/systemd/network"
+      
+      
+      def log(msg):
+          print(f"[privnet-namer] {msg}", flush=True)
+      
+      
+      def run(cmd):
+          # NB: platform-python on RHEL 8 is 3.6 -- no capture_output/text kwargs.
+          log("+ " + " ".join(cmd))
+          p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             universal_newlines=True)
+          if p.returncode != 0:
+              log(f"  -> rc={p.returncode}: {(p.stdout or '').strip()}")
+          return p
+      
+      
+      def get_instance_id():
+          url = "http://169.254.169.254/1.0/meta-data/instance-id"
+          with urllib.request.urlopen(url, timeout=5) as r:
+              return r.read().decode().strip()
+      
+      
+      def api_get_instance(key, secret, zone, instance_id):
+          host = f"https://api-{zone}.exoscale.com"
+          path = f"/v2/instance/{instance_id}"
+          expires = int(time.time()) + 600
+          sig_string = "\n".join([f"GET {path}", "", "", "", str(expires)])
+          sig = base64.b64encode(
+              hmac.new(secret.encode(), sig_string.encode(), hashlib.sha256).digest()
+          ).decode()
+          auth = f"EXO2-HMAC-SHA256 credential={key},expires={expires},signature={sig}"
+          req = urllib.request.Request(host + path, headers={"Authorization": auth})
+          with urllib.request.urlopen(req, timeout=15) as r:
+              return json.load(r)
+      
+      
+      def guest_macs():
+          out = {}
+          base = "/sys/class/net"
+          for name in os.listdir(base):
+              if name == "lo":
+                  continue
+              try:
+                  with open(f"{base}/{name}/address") as f:
+                      out[f.read().strip().lower()] = name
+              except OSError:
+                  pass
+          return out
+      
+      
+      def resolve_macs(key, secret, zone, want_ids, instance_id):
+          for attempt in range(1, 31):
+              inst = api_get_instance(key, secret, zone, instance_id)
+              id_to_mac = {
+                  pn["id"]: pn["mac-address"].lower()
+                  for pn in inst.get("private-networks", [])
+                  if pn.get("mac-address")
+              }
+              if want_ids <= set(id_to_mac):
+                  return id_to_mac
+              log(f"waiting for API MACs ({len(id_to_mac)}/{len(want_ids)})... {attempt}")
+              time.sleep(5)
+          raise SystemExit("timed out waiting for private-network MACs from API")
+      
+      
+      def wait_for_nics(want_macs):
+          for attempt in range(1, 31):
+              present = set(guest_macs())
+              if want_macs <= present:
+                  return
+              log(f"waiting for NICs ({len(want_macs & present)}/{len(want_macs)})... {attempt}")
+              time.sleep(3)
+          raise SystemExit("timed out waiting for private NICs to appear")
+      
+      
+      def apply(networks, id_to_mac):
+          # 1. Persistent naming for future boots: udev renames by MAC before NM runs.
+          os.makedirs(LINK_DIR, exist_ok=True)
+          for n in networks:
+              mac = id_to_mac[n["id"]]
+              with open(f"{LINK_DIR}/10-{n['name']}.link", "w") as f:
+                  f.write(f"[Match]\nMACAddress={mac}\n\n[Link]\nName={n['name']}\n")
+          run(["udevadm", "control", "--reload"])
+      
+          # 2. Current boot: rename the live device and configure it via NetworkManager.
+          macs = guest_macs()
+          for n in networks:
+              mac = id_to_mac[n["id"]]
+              cur = macs.get(mac)
+              name = n["name"]
+              if cur is None:
+                  log(f"WARNING: no NIC with MAC {mac} for {name}")
+                  continue
+              # drop any auto-created connection and let go of the device so we can rename it
+              run(["nmcli", "device", "disconnect", cur])
+              run(["nmcli", "device", "set", cur, "managed", "no"])
+              if cur != name:
+                  run(["ip", "link", "set", "dev", cur, "down"])
+                  run(["ip", "link", "set", "dev", cur, "name", name])
+              run(["ip", "link", "set", "dev", name, "up"])
+              run(["nmcli", "device", "set", name, "managed", "yes"])
+              # remove any auto-created profile bound to this device, plus a stale one
+              # of our own name, so the connection we add is the only one that matches
+              existing = run(["nmcli", "-t", "-f", "NAME", "connection", "show"])
+              for con in (existing.stdout or "").splitlines():
+                  if con == name or con.startswith("Wired connection"):
+                      run(["nmcli", "connection", "delete", con])
+              cmd = ["nmcli", "connection", "add", "type", "ethernet",
+                     "con-name", name, "ifname", name,
+                     "802-3-ethernet.mac-address", mac,
+                     "connection.autoconnect", "yes", "ipv6.method", "disabled"]
+              if n.get("cidr"):
+                  cmd += ["ipv4.method", "manual", "ipv4.addresses", n["cidr"]]
+              else:
+                  cmd += ["ipv4.method", "auto"]
+              if n.get("mtu"):
+                  cmd += ["802-3-ethernet.mtu", str(n["mtu"])]
+              run(cmd)
+              run(["nmcli", "connection", "up", name])
+      
+      
+      def main():
+          cfg = json.load(open(CONFIG))
+          key, secret, zone = cfg["api_key"], cfg["api_secret"], cfg["zone"]
+          networks = cfg["networks"]
+          want_ids = {n["id"] for n in networks}
+      
+          instance_id = get_instance_id()
+          log(f"instance-id {instance_id}, expecting {len(want_ids)} private network(s)")
+      
+          id_to_mac = resolve_macs(key, secret, zone, want_ids, instance_id)
+          wait_for_nics({id_to_mac[n["id"]] for n in networks})
+          apply(networks, id_to_mac)
+          log("done")
+      
+      
+      if __name__ == "__main__":
+          main()
+runcmd:
+  - [ /usr/libexec/platform-python, /usr/local/bin/privnet-namer.py ]

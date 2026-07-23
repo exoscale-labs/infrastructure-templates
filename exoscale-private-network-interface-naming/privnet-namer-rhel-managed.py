@@ -1,0 +1,126 @@
+#!/usr/libexec/platform-python
+"""
+privnet-namer (managed-network / offline variant, RHEL + NetworkManager).
+
+For MANAGED private networks the guest gets a DHCP lease from each network's
+subnet. That lease is enough to tell the networks apart -- no API call, no
+metadata, no internet -- so this works on instances created with
+--public-ip none.
+
+Each configured subnet is pinned to a stable interface name by MAC:
+  - write a systemd.link file so the name survives reboots (udev renames by
+    MAC before NetworkManager starts)
+  - rename the live device and give it a NetworkManager profile that keeps DHCP
+
+No extra packages required (runs on /usr/libexec/platform-python).
+Config: /etc/privnet-namer/config.json
+"""
+import ipaddress, json, os, subprocess, time
+
+CONFIG = os.environ.get("PRIVNET_NAMER_CONFIG", "/etc/privnet-namer/config.json")
+LINK_DIR = "/etc/systemd/network"
+
+
+def log(msg):
+    print("[privnet-namer] " + msg, flush=True)
+
+
+def run(cmd):
+    # platform-python on RHEL 8 is 3.6 -- no capture_output/text kwargs.
+    log("+ " + " ".join(cmd))
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       universal_newlines=True)
+    if p.returncode != 0:
+        log("  -> rc=%d: %s" % (p.returncode, (p.stdout or "").strip()))
+    return p
+
+
+def iface_ipv4(ifname):
+    p = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", ifname],
+                       stdout=subprocess.PIPE, universal_newlines=True)
+    out = []
+    for line in (p.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[2] == "inet":
+            out.append(parts[3].split("/")[0])
+    return out
+
+
+def scan():
+    """Return {ifname: {"mac": mac, "ips": [..]}} for every non-loopback NIC."""
+    res = {}
+    for ifname in os.listdir("/sys/class/net"):
+        if ifname == "lo":
+            continue
+        try:
+            with open("/sys/class/net/%s/address" % ifname) as f:
+                mac = f.read().strip().lower()
+        except OSError:
+            continue
+        res[ifname] = {"mac": mac, "ips": iface_ipv4(ifname)}
+    return res
+
+
+def match_networks(networks):
+    """Map each configured subnet to the NIC that holds an IP inside it."""
+    nets = [(ipaddress.ip_network(n["subnet"]), n) for n in networks]
+    for attempt in range(1, 41):
+        found = {}
+        for ifname, info in scan().items():
+            for ip in info["ips"]:
+                addr = ipaddress.ip_address(ip)
+                for net, n in nets:
+                    if addr in net:
+                        found[n["name"]] = (ifname, info["mac"], n, ip)
+        if len(found) == len(networks):
+            return found
+        log("waiting for DHCP on all subnets (%d/%d)... %d"
+            % (len(found), len(networks), attempt))
+        time.sleep(3)
+    raise SystemExit("timed out: not every configured subnet got a lease")
+
+
+def apply(found):
+    os.makedirs(LINK_DIR, exist_ok=True)
+    # 1. persistent naming for future boots
+    for name, (ifname, mac, n, ip) in found.items():
+        with open("%s/10-%s.link" % (LINK_DIR, name), "w") as f:
+            f.write("[Match]\nMACAddress=%s\n\n[Link]\nName=%s\n" % (mac, name))
+    run(["udevadm", "control", "--reload"])
+
+    # 2. current boot: rename + NetworkManager profile that keeps DHCP
+    for name, (ifname, mac, n, ip) in found.items():
+        log("subnet %s -> %s (mac %s, lease %s)" % (n["subnet"], name, mac, ip))
+        run(["nmcli", "device", "disconnect", ifname])
+        run(["nmcli", "device", "set", ifname, "managed", "no"])
+        if ifname != name:
+            run(["ip", "link", "set", "dev", ifname, "down"])
+            run(["ip", "link", "set", "dev", ifname, "name", name])
+        run(["ip", "link", "set", "dev", name, "up"])
+        run(["nmcli", "device", "set", name, "managed", "yes"])
+        existing = run(["nmcli", "-t", "-f", "NAME", "connection", "show"])
+        for con in (existing.stdout or "").splitlines():
+            if con == name or con.startswith("Wired connection"):
+                run(["nmcli", "connection", "delete", con])
+        cmd = ["nmcli", "connection", "add", "type", "ethernet",
+               "con-name", name, "ifname", name,
+               "802-3-ethernet.mac-address", mac,
+               "connection.autoconnect", "yes",
+               "ipv4.method", "auto", "ipv6.method", "disabled"]
+        if n.get("mtu"):
+            cmd += ["802-3-ethernet.mtu", str(n["mtu"])]
+        run(cmd)
+        run(["nmcli", "connection", "up", name])
+
+
+def main():
+    cfg = json.load(open(CONFIG))
+    networks = cfg["networks"]
+    log("expecting %d managed private network(s)" % len(networks))
+    found = match_networks(networks)
+    apply(found)
+    log("done")
+
+
+if __name__ == "__main__":
+    main()

@@ -38,24 +38,43 @@ the kernel called it (`ens6`, `ens7`, whatever).
 There are two variants because the network stack differs by distro. Pick one —
 each is a single self-contained cloud-init file with the helper embedded:
 
-| Distro | cloud-init | mechanism |
-|--------|-----------|-----------|
-| Ubuntu / Debian | `cloud-init-ubuntu.yaml` | netplan, `python3` |
-| RHEL / Rocky / Alma 8–9 | `cloud-init-rhel.yaml` | NetworkManager + `systemd.link`, `platform-python` |
+There are two approaches. Pick by whether your private networks are **managed**
+(they have a subnet/DHCP range) or **unmanaged** (no DHCP):
+
+| Networks | cloud-init | how it finds each network | needs |
+|----------|-----------|---------------------------|-------|
+| **Managed** (RHEL/Rocky/Alma) | `cloud-init-rhel-managed.yaml` | DHCP lease subnet (local) | nothing |
+| Unmanaged (RHEL/Rocky/Alma) | `cloud-init-rhel.yaml` | API lookup by MAC | scoped API key + internet |
+| Unmanaged (Ubuntu/Debian) | `cloud-init-ubuntu.yaml` | API lookup by MAC | scoped API key + internet |
 
 The `privnet-namer-*.py` files are the same helpers kept standalone for reading
-and editing. `role-policy.json` is the IAM policy for the scoped key.
+and editing. `role-policy.json` is the IAM policy for the scoped key (unmanaged
+variants only).
 
-### Why two
+### If you can use managed networks, do
+
+The managed variant is the simplest and the most robust: a managed network hands
+out a DHCP lease on its own subnet, so the guest tells the networks apart locally
+with no API call, no key, no metadata, and no internet. That also means it is the
+only variant that works with `--public-ip none` — a private instance has no route
+to the API, so the in-guest lookup the unmanaged variants rely on cannot run
+there. Managed does not cost you addressing control: you set the CIDR at creation
+and can pin exact IPs with `attach --ip`.
+
+Use an unmanaged variant only if you genuinely cannot use managed networks. Those
+instances then need a scoped API key in the instance and outbound internet, and
+they will not work with `--public-ip none`.
+
+### Why RHEL differs from Ubuntu
 
 The Ubuntu image ships netplan and `python3`. RHEL ships neither by that name —
 it uses NetworkManager, and Python is present only as
 `/usr/libexec/platform-python` (3.6), which is what cloud-init itself runs on.
-The RHEL variant uses those directly, so it needs no extra packages — it works
-on an unsubscribed BYOL image where `dnf install` isn't available. It also drops
-a `systemd.link` file per network so the naming survives reboots (udev renames
-by MAC before NetworkManager starts), and renames the live device for the first
-boot.
+The RHEL variants use those directly, so they need no extra packages and work on
+an unsubscribed BYOL image where `dnf install` isn't available. Every variant
+drops a `systemd.link` file per network so the naming survives reboots (udev
+renames by MAC before NetworkManager starts), and renames the live device for the
+first boot.
 
 ## Requirements
 
@@ -63,7 +82,34 @@ boot.
 - The private networks created ahead of time (you need their UUIDs).
 - A scoped API key (below).
 
-## Setup
+## Setup — managed variant (`cloud-init-rhel-managed.yaml`)
+
+No API key, no IAM role. Just edit the `networks` block: each managed network's
+subnet and the interface name you want.
+
+```json
+{
+  "networks": [
+    { "subnet": "10.0.10.0/24", "name": "oam" },
+    { "subnet": "10.0.20.0/24", "name": "mgmt" }
+  ]
+}
+```
+
+Then create the instance with the managed networks attached (public IP optional):
+
+```bash
+exo compute instance create my-instance -z de-fra-1 \
+  --instance-type standard.medium \
+  --template "Linux RedHat 8.10 BYOL 64-bit" \
+  --ssh-key <your-key> --public-ip none \
+  --private-network oam_net --private-network mgmt_net \
+  --cloud-init cloud-init-rhel-managed.yaml
+```
+
+That's it. The rest of this section is only for the unmanaged (API) variants.
+
+## Setup — unmanaged variants
 
 ### 1. Create a read-only API key
 
@@ -141,9 +187,12 @@ The order of the `--private-network` flags doesn't matter — that's the point.
   `/usr/libexec/platform-python /usr/local/bin/privnet-namer.py` (RHEL).
 - The primary/public interface (`eth0`/`ens3`) is left alone. Only the private
   NICs listed in the config are touched.
-- Managed networks don't strictly need this — you can tell them apart by which
-  subnet each NIC gets a DHCP lease from. It's the unmanaged case, with no DHCP,
-  where the MAC lookup is the only reliable handle.
+- The config reference above is for the unmanaged (API) variants. The managed
+  variant's config is just `{ "subnet": "...", "name": "..." }` per network, with
+  an optional `mtu` — no key, no zone, no UUIDs.
+- The managed variant re-runs safely: `/usr/libexec/platform-python
+  /usr/local/bin/privnet-namer.py`. It re-derives everything from the current
+  leases, so no state to keep in sync.
 
 ## Testing
 
@@ -156,6 +205,12 @@ Both variants were booted verbatim (minus the placeholders) on Exoscale.
   NetworkManager, and it held across a reboot — after the reboot the helper does
   not run again; the `systemd.link` files and saved NetworkManager profiles
   bring the interfaces back up correctly on their own.
+- **RHEL 8.10 BYOL, managed variant, `--public-ip none`** (`de-fra-1`): a private
+  instance with no public IP, two managed networks. It got DHCP leases on both
+  subnets and the helper named the interfaces `oam` (`10.0.10.30`) and `mgmt`
+  (`10.0.20.50`) with no API, key, metadata, or internet involved. Verified from
+  inside the instance by relaying its state to an observer on the same private
+  network (the instance itself has no outbound path). Also held across a reboot.
 
 The helper logs to the cloud-init output, so if something goes wrong:
 

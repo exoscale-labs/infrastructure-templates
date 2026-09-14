@@ -35,15 +35,14 @@ the kernel called it (`ens6`, `ens7`, whatever).
 
 ## Which file to use
 
-There are two variants because the network stack differs by distro. Pick one —
-each is a single self-contained cloud-init file with the helper embedded:
-
-There are two approaches. Pick by whether your private networks are **managed**
+Each file is a single self-contained cloud-init with the helper embedded.
+Pick by whether your private networks are **managed**
 (they have a subnet/DHCP range) or **unmanaged** (no DHCP):
 
 | Networks | cloud-init | how it finds each network | needs |
 |----------|-----------|---------------------------|-------|
 | **Managed** (RHEL/Rocky/Alma) | `cloud-init-rhel-managed.yaml` | DHCP lease subnet (local) | nothing |
+| **Managed** (Ubuntu/Debian) | `cloud-init-ubuntu-managed.yaml` | DHCP lease subnet (local) | nothing |
 | Unmanaged (RHEL/Rocky/Alma) | `cloud-init-rhel.yaml` | API lookup by MAC | scoped API key + internet |
 | Unmanaged (Ubuntu/Debian) | `cloud-init-ubuntu.yaml` | API lookup by MAC | scoped API key + internet |
 
@@ -53,13 +52,16 @@ variants only).
 
 ### If you can use managed networks, do
 
-The managed variant is the simplest and the most robust: a managed network hands
-out a DHCP lease on its own subnet, so the guest tells the networks apart locally
-with no API call, no key, no metadata, and no internet. That also means it is the
-only variant that works with `--public-ip none` — a private instance has no route
-to the API, so the in-guest lookup the unmanaged variants rely on cannot run
-there. Managed does not cost you addressing control: you set the CIDR at creation
-and can pin exact IPs with `attach --ip`.
+The managed variants are the simplest and the most robust: a managed network
+hands out a DHCP lease on its own subnet, so the guest tells the networks apart
+locally with no API call, no key, no metadata, and no internet. That also makes
+them the only variants that work with `--public-ip none` — a private instance has
+no route to the API, so the in-guest lookup the unmanaged variants rely on cannot
+run there. Managed does not cost you addressing control: you set the CIDR at
+creation and can pin exact IPs with `private-network attach --ip` (at attach
+time) or `instance private-network update-ip --ip` (afterwards). A pinned address
+is picked up on the next reboot and the interface keeps its name, because the
+name is bound to the MAC, not the address.
 
 Use an unmanaged variant only if you genuinely cannot use managed networks. Those
 instances then need a scoped API key in the instance and outbound internet, and
@@ -72,9 +74,44 @@ it uses NetworkManager, and Python is present only as
 `/usr/libexec/platform-python` (3.6), which is what cloud-init itself runs on.
 The RHEL variants use those directly, so they need no extra packages and work on
 an unsubscribed BYOL image where `dnf install` isn't available. Every variant
-drops a `systemd.link` file per network so the naming survives reboots (udev
-renames by MAC before NetworkManager starts), and renames the live device for the
-first boot.
+pins the name by MAC through a systemd `.link` file so the naming survives
+reboots (udev renames by MAC before the network stack starts), and renames the
+live device for the first boot.
+
+There is a second, less obvious difference that matters for the **managed**
+variants. On RHEL/Rocky, NetworkManager auto-creates a DHCP profile ("Wired
+connection N") for every NIC nothing else claims, so by the time the namer runs
+the leases are already there and it only has to read them.
+
+Netplan has no such fallback — it configures only what is declared. And the
+Exoscale Ubuntu 24.04 template ships a `/etc/netplan/50-cloud-init.yaml` that
+matches the QEMU default MAC `52:54:00:12:34:56`, which no instance actually
+has:
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    ens3:
+      match:
+        macaddress: "52:54:00:12:34:56"
+      dhcp4: true
+```
+
+On an instance created with `--public-ip none` that means netplan manages
+nothing, no interface ever runs DHCP, and the instance boots with no addresses
+at all — reachable only through the emergency console. (With a public IP the
+problem is masked: cloud-init rewrites the file from the datasource, so the
+public NIC comes up and only the private NICs stay unconfigured.)
+
+So `cloud-init-ubuntu-managed.yaml` does three phases instead of one: it parks
+the shipped netplan config (keeping a copy in
+`/var/log/privnet-namer/original-netplan/`), brings DHCP up on every NIC so
+leases can arrive, and only then does the subnet → MAC → name mapping. It also
+writes `/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg` so cloud-init does
+not regenerate the broken file on the next boot, and re-emits any NIC it did not
+pin (the public interface, typically) by MAC with plain DHCP so connectivity is
+preserved.
 
 ## Requirements
 

@@ -2,7 +2,7 @@
 
 # Deterministic private-network interface naming on Exoscale.
 #
-# Ubuntu 24.04 / Netplan
+# Ubuntu 24.04 / Debian -- netplan
 #
 # MANAGED private networks, offline:
 # - no Exoscale API
@@ -11,22 +11,47 @@
 # - no internet required
 # - works with --public-ip none
 #
-# Each managed private network provides a DHCP lease.
-# The subnet of that lease is used to identify the network.
-#
-# The script then creates a persistent Netplan configuration:
-#
-#   subnet -> MAC address -> desired interface name
-#
-# Example:
+# Each managed private network hands out a DHCP lease from its own subnet, so
+# the subnet of the lease identifies the network -- no API lookup needed.
 #
 #   10.1.1.0/24 -> MAC xx:xx:xx:xx:xx:01 -> vnf_mgmt
 #   10.1.3.0/24 -> MAC xx:xx:xx:xx:xx:02 -> sig_int
 #   10.1.5.0/24 -> MAC xx:xx:xx:xx:xx:03 -> oam_ne
 #
-# Fill in each network's subnet and desired interface name.
+# IMPORTANT -- why this file also rewrites the netplan config:
+#
+# On RHEL/Rocky, NetworkManager auto-creates a DHCP profile for every NIC that
+# nothing else claims, so the leases are simply there. Netplan has no such
+# fallback, and the Exoscale Ubuntu 24.04 template ships a
+# /etc/netplan/50-cloud-init.yaml that matches the QEMU default MAC
+# 52:54:00:12:34:56 -- a MAC the instance does not have. On an instance created
+# with --public-ip none that means netplan manages nothing, no interface ever
+# runs DHCP, and the instance boots with no addresses at all (reachable only
+# via the emergency console).
+#
+# So this file parks the shipped netplan config (a copy is kept in
+# /var/log/privnet-namer/original-netplan/), brings DHCP up on every NIC, and
+# only then does the subnet -> MAC -> name mapping.
+#
+# Attach the private networks in the `create` call, not afterwards -- cloud-init
+# only sees the NICs that exist while it runs:
+#
+#   exo compute instance create NAME \
+#     --public-ip none -z de-fra-1 \
+#     --template "Linux Ubuntu 24.04 LTS 64-bit" \
+#     --cloud-init cloud-init-ubuntu-managed.yaml \
+#     --private-network vnf_mgmt --private-network sig_int --private-network oam_ne
+#
+# Fill in each network's subnet and desired interface name below.
 
 write_files:
+
+  # Keep cloud-init from regenerating the broken 50-cloud-init.yaml on the next
+  # boot -- from here on the netplan config is ours.
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    permissions: '0644'
+    content: |
+      network: {config: disabled}
 
   - path: /etc/privnet-namer/config.json
     permissions: '0600'
@@ -43,45 +68,51 @@ write_files:
     permissions: '0755'
     content: |
       #!/usr/bin/env python3
-
       """
-      privnet-namer
-      Ubuntu 24.04 / Netplan / managed Exoscale private networks.
+      privnet-namer (managed-network / offline variant, Ubuntu/Debian + netplan).
 
-      Managed private networks provide DHCP leases from their respective
-      subnets. The DHCP address is therefore sufficient to identify the
-      private network without using the Exoscale API, metadata or Internet.
+      For MANAGED private networks the guest gets a DHCP lease from each network's
+      subnet. That lease is enough to tell the networks apart -- no API call, no
+      metadata, no internet -- so this works on instances created with
+      --public-ip none.
 
-      The script:
+      Why this is more work than the RHEL variant
+      -------------------------------------------
+      On RHEL/Rocky, NetworkManager auto-creates a DHCP profile ("Wired connection N")
+      for every NIC nothing else claims, so the leases are already there when the
+      namer runs. Netplan has no such fallback: it only configures what is declared.
 
-        1. waits for DHCP leases on all configured private networks
-        2. identifies the interface belonging to each subnet
-        3. obtains its MAC address
-        4. creates a persistent Netplan configuration
-        5. assigns the requested interface name
-        6. enables DHCP on the interface
+      Worse, the Exoscale Ubuntu 24.04 template ships a /etc/netplan/50-cloud-init.yaml
+      that matches a MAC the instance does not have (the QEMU default
+      52:54:00:12:34:56) -- so on an instance created with --public-ip none, netplan
+      manages *nothing*, no interface ever runs DHCP, and the instance comes up with
+      no addresses at all.
 
-      Configuration:
-        /etc/privnet-namer/config.json
+      So this script runs in three phases:
 
-      Generated Netplan:
-        /etc/netplan/99-privnet-namer.yaml
+        1. bootstrap  -- park the stale netplan config, bring DHCP up on every
+                         ethernet NIC, so leases can actually arrive
+        2. identify   -- subnet of the lease -> interface -> MAC  (as on RHEL)
+        3. pin        -- write the final netplan that matches each MAC and renames
+                         the interface, rename the live devices, re-apply
+
+      No extra packages required (python3 and netplan are in the cloud image).
+      Config: /etc/privnet-namer/config.json
       """
-
       import ipaddress
       import json
       import os
+      import shutil
       import subprocess
       import sys
       import time
 
+      CONFIG = os.environ.get("PRIVNET_NAMER_CONFIG", "/etc/privnet-namer/config.json")
 
-      CONFIG = os.environ.get(
-          "PRIVNET_NAMER_CONFIG",
-          "/etc/privnet-namer/config.json"
-      )
-
-      NETPLAN_FILE = "/etc/netplan/99-privnet-namer.yaml"
+      NETPLAN_DIR = "/etc/netplan"
+      BOOTSTRAP_FILE = NETPLAN_DIR + "/98-privnet-bootstrap.yaml"
+      FINAL_FILE = NETPLAN_DIR + "/99-privnet-namer.yaml"
+      BACKUP_DIR = "/var/log/privnet-namer/original-netplan"
 
 
       def log(msg):
@@ -90,345 +121,268 @@ write_files:
 
       def run(cmd, check=False):
           log("+ " + " ".join(cmd))
-
-          p = subprocess.run(
-              cmd,
-              stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
-              universal_newlines=True
-          )
-
-          output = (p.stdout or "").strip()
-
-          if output:
-              log("  " + output)
-
+          p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             universal_newlines=True)
+          out = (p.stdout or "").strip()
+          if out:
+              for line in out.splitlines():
+                  log("  " + line)
           if check and p.returncode != 0:
-              raise RuntimeError(
-                  "command failed with rc=%d: %s"
-                  % (p.returncode, output)
-              )
-
+              raise RuntimeError("command failed rc=%d: %s" % (p.returncode, out))
           return p
 
 
       def iface_ipv4(ifname):
-          """
-          Return all IPv4 addresses assigned to an interface.
-          """
-
-          p = subprocess.run(
-              [
-                  "ip",
-                  "-o",
-                  "-4",
-                  "addr",
-                  "show",
-                  "dev",
-                  ifname
-              ],
-              stdout=subprocess.PIPE,
-              stderr=subprocess.DEVNULL,
-              universal_newlines=True
-          )
-
-          addresses = []
-
+          p = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", ifname],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True)
+          out = []
           for line in (p.stdout or "").splitlines():
-
               parts = line.split()
-
               if len(parts) >= 4 and parts[2] == "inet":
-                  addresses.append(
-                      parts[3].split("/")[0]
-                  )
-
-          return addresses
+                  out.append(parts[3].split("/")[0])
+          return out
 
 
       def scan():
-          """
-          Return information about all non-loopback interfaces.
-
-          Result:
-
-            {
-              "ens3": {
-                "mac": "aa:bb:cc:dd:ee:ff",
-                "ips": ["10.1.1.23"]
-              }
-            }
-          """
-
-          result = {}
-
-          for ifname in os.listdir("/sys/class/net"):
-
+          """Return {ifname: {"mac": mac, "ips": [..]}} for every real ethernet NIC."""
+          res = {}
+          for ifname in sorted(os.listdir("/sys/class/net")):
               if ifname == "lo":
                   continue
-
+              # Skip virtual devices (bridges, veth, docker0, ...): only NICs with a
+              # real driver are candidates for a private network.
+              if not os.path.exists("/sys/class/net/%s/device" % ifname):
+                  continue
               try:
-                  with open(
-                      "/sys/class/net/%s/address" % ifname
-                  ) as f:
+                  with open("/sys/class/net/%s/address" % ifname) as f:
                       mac = f.read().strip().lower()
-
               except OSError:
                   continue
+              res[ifname] = {"mac": mac, "ips": iface_ipv4(ifname)}
+          return res
 
-              result[ifname] = {
-                  "mac": mac,
-                  "ips": iface_ipv4(ifname)
-              }
 
-          return result
+      # --------------------------------------------------------------------------
+      # Phase 1: bootstrap DHCP
+      # --------------------------------------------------------------------------
 
+      def bootstrap_dhcp():
+          """
+          Park every pre-existing netplan config and bring DHCP up on all NICs.
+
+          The shipped 50-cloud-init.yaml cannot be trusted: on --public-ip none
+          instances it matches a MAC that does not exist on this machine. We keep a
+          copy under /var/log for diagnostics, then replace the lot with one
+          catch-all DHCP stanza so that every NIC -- public and private -- gets a
+          lease and phase 2 has something to work with.
+          """
+          os.makedirs(BACKUP_DIR, exist_ok=True)
+          parked = []
+          for name in sorted(os.listdir(NETPLAN_DIR)):
+              if not name.endswith((".yaml", ".yml")):
+                  continue
+              if name in (os.path.basename(BOOTSTRAP_FILE), os.path.basename(FINAL_FILE)):
+                  continue
+              src = os.path.join(NETPLAN_DIR, name)
+              shutil.copy2(src, os.path.join(BACKUP_DIR, name))
+              os.rename(src, src + ".privnet-namer-disabled")
+              parked.append(name)
+              log("parked %s (copy kept in %s)" % (src, BACKUP_DIR))
+              with open(os.path.join(BACKUP_DIR, name)) as f:
+                  for line in f:
+                      log("    | " + line.rstrip())
+
+          if not parked:
+              log("no pre-existing netplan config found")
+
+          with open(BOOTSTRAP_FILE, "w") as f:
+              f.write(
+                  "network:\n"
+                  "  version: 2\n"
+                  "  renderer: networkd\n"
+                  "  ethernets:\n"
+                  "    privnet-bootstrap-all:\n"
+                  "      match:\n"
+                  "        name: 'e*'\n"
+                  "      dhcp4: true\n"
+                  "      dhcp6: false\n"
+                  "      optional: true\n"
+              )
+          os.chmod(BOOTSTRAP_FILE, 0o600)
+          log("wrote %s (temporary catch-all DHCP)" % BOOTSTRAP_FILE)
+
+          run(["netplan", "generate"], check=True)
+          run(["netplan", "apply"], check=True)
+
+
+      # --------------------------------------------------------------------------
+      # Phase 2: identify each network by its DHCP lease subnet
+      # --------------------------------------------------------------------------
 
       def match_networks(networks):
-          """
-          Match every configured subnet against the DHCP address
-          currently assigned to an interface.
-          """
-
-          configured = [
-              (
-                  ipaddress.ip_network(n["subnet"]),
-                  n
-              )
-              for n in networks
-          ]
-
-          # Wait up to 2 minutes for DHCP.
+          """Map each configured subnet to the NIC holding an IP inside it."""
+          nets = [(ipaddress.ip_network(n["subnet"]), n) for n in networks]
           for attempt in range(1, 41):
-
               found = {}
-
               for ifname, info in scan().items():
-
                   for ip in info["ips"]:
-
                       addr = ipaddress.ip_address(ip)
-
-                      for net, network in configured:
-
+                      for net, n in nets:
                           if addr in net:
-
-                              name = network["name"]
-
-                              if name in found:
+                              name = n["name"]
+                              if name in found and found[name][0] != ifname:
                                   raise RuntimeError(
-                                      "multiple interfaces match "
-                                      "subnet %s"
-                                      % network["subnet"]
-                                  )
-
-                              found[name] = (
-                                  ifname,
-                                  info["mac"],
-                                  network,
-                                  ip
-                              )
-
+                                      "multiple interfaces hold an address in %s"
+                                      % n["subnet"])
+                              found[name] = (ifname, info["mac"], n, ip)
               if len(found) == len(networks):
                   return found
-
-              log(
-                  "waiting for DHCP on all subnets "
-                  "(%d/%d), attempt %d/40"
-                  % (
-                      len(found),
-                      len(networks),
-                      attempt
-                  )
-              )
-
+              log("waiting for DHCP on all subnets (%d/%d), attempt %d/40"
+                  % (len(found), len(networks), attempt))
               time.sleep(3)
+          raise RuntimeError("timed out: not every configured subnet received a lease")
 
-          raise RuntimeError(
-              "timed out: not every configured subnet "
-              "received a DHCP lease"
-          )
 
+      # --------------------------------------------------------------------------
+      # Phase 3: pin names by MAC
+      # --------------------------------------------------------------------------
 
       def generate_netplan(found):
           """
-          Generate persistent Netplan configuration.
+          Write the persistent netplan config.
 
-          Interfaces are matched by MAC address and renamed
-          using Netplan's set-name.
+          Each private network is matched by MAC and renamed via set-name (netplan
+          turns that into a systemd .link file, so the name is applied by udev before
+          networkd starts -- it survives reboots).
+
+          Any other NIC (typically the public interface on instances that have one)
+          is emitted by MAC with plain DHCP, so that removing the bootstrap file does
+          not leave it unmanaged.
           """
+          pinned_macs = set(mac for (_, mac, _, _) in found.values())
 
-          lines = []
+          lines = ["network:", "  version: 2", "  renderer: networkd", "  ethernets:"]
 
-          lines.append("network:")
-          lines.append("  version: 2")
-          lines.append("  renderer: networkd")
-          lines.append("  ethernets:")
-
-          # Deterministic ordering.
-          for name in sorted(found.keys()):
-
+          for name in sorted(found):
               ifname, mac, network, ip = found[name]
-
-              lines.append(
-                  "    %s:" % name
-              )
-
+              lines.append("    %s:" % name)
               lines.append("      match:")
-
-              # Quote MAC addresses explicitly.
-              lines.append(
-                  "        macaddress: '%s'"
-                  % mac
-              )
-
-              lines.append(
-                  "      set-name: '%s'"
-                  % name
-              )
-
-              lines.append(
-                  "      dhcp4: true"
-              )
-
-              lines.append(
-                  "      dhcp6: false"
-              )
-
-              lines.append(
-                  "      optional: true"
-              )
-
+              lines.append("        macaddress: '%s'" % mac)
+              lines.append("      set-name: '%s'" % name)
+              lines.append("      dhcp4: true")
+              lines.append("      dhcp6: false")
+              lines.append("      optional: true")
               if network.get("mtu"):
-                  lines.append(
-                      "      mtu: %s"
-                      % int(network["mtu"])
-                  )
+                  lines.append("      mtu: %s" % int(network["mtu"]))
+
+          others = 0
+          for ifname, info in sorted(scan().items()):
+              if info["mac"] in pinned_macs:
+                  continue
+              others += 1
+              lines.append("    privnet-other-%d:" % others)
+              lines.append("      match:")
+              lines.append("        macaddress: '%s'" % info["mac"])
+              lines.append("      dhcp4: true")
+              lines.append("      dhcp6: false")
+              lines.append("      optional: true")
 
           lines.append("")
 
-          with open(NETPLAN_FILE, "w") as f:
-              f.write(
-                  "\n".join(lines)
-              )
+          with open(FINAL_FILE, "w") as f:
+              f.write("\n".join(lines))
+          os.chmod(FINAL_FILE, 0o600)
 
-          os.chmod(
-              NETPLAN_FILE,
-              0o600
-          )
-
-          log(
-              "generated %s"
-              % NETPLAN_FILE
-          )
-
-          with open(NETPLAN_FILE) as f:
+          log("generated %s:" % FINAL_FILE)
+          with open(FINAL_FILE) as f:
               for line in f:
-                  log(
-                      "  " + line.rstrip()
-                  )
+                  log("  " + line.rstrip())
 
 
-      def validate_netplan():
+      def rename_live(found):
           """
-          Validate the generated Netplan configuration.
+          Rename the devices for the *current* boot.
+
+          netplan's set-name is applied by udev when the device appears, so it only
+          takes effect from the next boot. Do the rename by hand here so the instance
+          is usable immediately (same approach as the RHEL variant).
           """
-
-          p = run(
-              [
-                  "netplan",
-                  "generate"
-              ]
-          )
-
-          if p.returncode != 0:
-              raise RuntimeError(
-                  "netplan generate failed"
-              )
+          for name in sorted(found):
+              ifname, mac, network, ip = found[name]
+              if ifname == name:
+                  log("%s already named correctly" % name)
+                  continue
+              log("renaming %s -> %s (mac %s, lease %s)" % (ifname, name, mac, ip))
+              run(["ip", "link", "set", "dev", ifname, "down"])
+              run(["ip", "link", "set", "dev", ifname, "name", name], check=True)
+              run(["ip", "link", "set", "dev", name, "up"])
 
 
-      def apply_netplan():
-          """
-          Apply the generated Netplan configuration.
-          """
-
-          run(
-              [
-                  "netplan",
-                  "apply"
-              ],
-              check=True
-          )
+      def wait_for_addresses(found, timeout=90):
+          """Confirm every pinned interface got its lease back after the rename."""
+          deadline = time.time() + timeout
+          while time.time() < deadline:
+              missing = []
+              for name in sorted(found):
+                  net = ipaddress.ip_network(found[name][2]["subnet"])
+                  if not any(ipaddress.ip_address(ip) in net for ip in iface_ipv4(name)):
+                      missing.append(name)
+              if not missing:
+                  return True
+              log("waiting for leases on: %s" % ", ".join(missing))
+              time.sleep(3)
+          return False
 
 
       def main():
-
-          log(
-              "loading configuration: %s"
-              % CONFIG
-          )
-
+          log("loading configuration: %s" % CONFIG)
           with open(CONFIG) as f:
               config = json.load(f)
 
-          networks = config.get(
-              "networks",
-              []
-          )
-
+          networks = config.get("networks", [])
           if not networks:
-              raise RuntimeError(
-                  "no networks configured"
-              )
+              raise RuntimeError("no networks configured")
 
-          log(
-              "expecting %d managed private network(s)"
-              % len(networks)
-          )
+          log("expecting %d managed private network(s)" % len(networks))
 
-          found = match_networks(
-              networks
-          )
+          log("--- phase 1: bootstrap DHCP on all interfaces ---")
+          bootstrap_dhcp()
 
-          for name in sorted(found.keys()):
-
+          log("--- phase 2: identify networks by lease subnet ---")
+          found = match_networks(networks)
+          for name in sorted(found):
               ifname, mac, network, ip = found[name]
+              log("subnet %s -> %s -> MAC %s (currently %s, lease %s)"
+                  % (network["subnet"], name, mac, ifname, ip))
 
-              log(
-                  "matched subnet %s -> "
-                  "interface %s -> "
-                  "MAC %s -> DHCP %s"
-                  % (
-                      network["subnet"],
-                      name,
-                      mac,
-                      ip
-                  )
-              )
+          log("--- phase 3: pin interface names by MAC ---")
+          generate_netplan(found)
+          run(["netplan", "generate"], check=True)
 
-          generate_netplan(
-              found
-          )
+          # Drop the bootstrap stanza: the final file now covers every NIC.
+          if os.path.exists(BOOTSTRAP_FILE):
+              os.remove(BOOTSTRAP_FILE)
+              log("removed %s" % BOOTSTRAP_FILE)
 
-          validate_netplan()
+          rename_live(found)
+          run(["netplan", "apply"], check=True)
 
-          apply_netplan()
+          if wait_for_addresses(found):
+              log("all interfaces named and addressed:")
+          else:
+              log("WARNING: not every interface regained its lease, state is:")
+          for name in sorted(found):
+              log("  %s -> %s" % (name, ", ".join(iface_ipv4(name)) or "no address"))
 
           log("done")
 
 
       if __name__ == "__main__":
-
           try:
               main()
-
           except Exception as e:
-
-              log(
-                  "ERROR: %s"
-                  % e
-              )
-
+              log("ERROR: %s" % e)
               sys.exit(1)
 
 

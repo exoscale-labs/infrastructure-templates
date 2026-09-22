@@ -43,6 +43,7 @@ Pick by whether your private networks are **managed**
 |----------|-----------|---------------------------|-------|
 | **Managed** (RHEL/Rocky/Alma) | `cloud-init-rhel-managed.yaml` | DHCP lease subnet (local) | nothing |
 | **Managed** (Ubuntu/Debian) | `cloud-init-ubuntu-managed.yaml` | DHCP lease subnet (local) | nothing |
+| **Managed** (openSUSE Leap 16) | `cloud-init-suse-managed.yaml` | DHCP lease subnet (local) | nothing |
 | Unmanaged (RHEL/Rocky/Alma) | `cloud-init-rhel.yaml` | API lookup by MAC | scoped API key + internet |
 | Unmanaged (Ubuntu/Debian) | `cloud-init-ubuntu.yaml` | API lookup by MAC | scoped API key + internet |
 
@@ -67,7 +68,7 @@ Use an unmanaged variant only if you genuinely cannot use managed networks. Thos
 instances then need a scoped API key in the instance and outbound internet, and
 they will not work with `--public-ip none`.
 
-### Why RHEL differs from Ubuntu
+### Why the variants differ per distribution
 
 The Ubuntu image ships netplan and `python3`. RHEL ships neither by that name —
 it uses NetworkManager, and Python is present only as
@@ -113,13 +114,50 @@ not regenerate the broken file on the next boot, and re-emits any NIC it did not
 pin (the public interface, typically) by MAC with plain DHCP so connectivity is
 preserved.
 
+### openSUSE
+
+openSUSE Leap 16 dropped wicked, so it is a NetworkManager system like RHEL —
+same mechanism, same auto-created DHCP profile for every unclaimed NIC. Three
+details differ, and `cloud-init-suse-managed.yaml` handles them:
+
+- Python is a normal `/usr/bin/python3` (3.13 on Leap 16), not platform-python.
+- cloud-init renders its network config as a NetworkManager keyfile bound to a
+  **MAC address** (`/etc/NetworkManager/system-connections/cloud-init-eth0.nmconnection`,
+  `autoconnect-priority=120`), and it is re-rendered on boot. With
+  `--public-ip none` that profile sits on a private NIC and follows it through
+  the rename. So the SUSE helper deletes any profile bound to a MAC or interface
+  it takes over and writes its own at priority 200.
+- It does not assume the image runs DHCP on the private NICs at all. If a
+  configured subnet still has no lease after ~15 seconds, the helper brings DHCP
+  up on the unaddressed NICs itself, and keeps doing so as further NICs appear
+  (they are attached while the instance boots). Without a lease a NIC cannot be
+  matched to its network, so waiting for one that is never coming is the one
+  failure mode worth designing out — a custom image with NetworkManager's
+  `no-auto-default` set would otherwise hang until the timeout.
+
+Worth knowing: on an instance created with `--public-ip none`, cloud-init falls
+back to the config drive (`DataSourceNoCloud`) and writes that keyfile with the
+QEMU placeholder MAC `52:54:00:12:34:56` — the same bogus MAC that breaks Ubuntu.
+On the stock Leap 16 image it is harmless, because NetworkManager's auto-default
+still gives every unclaimed NIC a DHCP lease, so the instance is never left
+without addresses.
+
+**SLES 15 is a different system and is not covered by this file.** The Exoscale
+`SUSE Linux Enterprise Server 15 SP7` template still runs wicked, has no
+NetworkManager and no `nmcli`, and its Python is 3.6. There the private NICs
+stay `device-unconfigured` — attached, but without an address, so `ip -4 a` shows
+nothing but `lo` and `eth0`. The helper detects this and exits with an
+explanation instead of failing obscurely; a wicked system needs its own variant
+(ifcfg files plus `wicked ifup`).
+
 ## Requirements
 
-- Ubuntu/Debian, or RHEL/Rocky/Alma 8 or 9. Uses only what's on the base image.
+- Ubuntu/Debian, RHEL/Rocky/Alma 8 or 9, or openSUSE Leap 16. Uses only what's
+  on the base image. (SLES 15 runs wicked — see above.)
 - The private networks created ahead of time (you need their UUIDs).
 - A scoped API key (below).
 
-## Setup — managed variant (`cloud-init-rhel-managed.yaml`)
+## Setup — managed variants (`cloud-init-rhel-managed.yaml`, `cloud-init-suse-managed.yaml`, `cloud-init-ubuntu-managed.yaml`)
 
 No API key, no IAM role. Just edit the `networks` block: each managed network's
 subnet and the interface name you want.
@@ -142,6 +180,17 @@ exo compute instance create my-instance -z de-fra-1 \
   --ssh-key <your-key> --public-ip none \
   --private-network oam_net --private-network mgmt_net \
   --cloud-init cloud-init-rhel-managed.yaml
+```
+
+Same for openSUSE, just the other file:
+
+```bash
+exo compute instance create my-instance -z de-fra-1 \
+  --instance-type standard.medium \
+  --template "OpenSUSE Leap 16.0 64-bit" \
+  --ssh-key <your-key> --public-ip none \
+  --private-network oam_net --private-network mgmt_net \
+  --cloud-init cloud-init-suse-managed.yaml
 ```
 
 That's it. The rest of this section is only for the unmanaged (API) variants.
@@ -220,20 +269,21 @@ The order of the `--private-network` flags doesn't matter — that's the point.
   the finished file in via `write_files`) — same idea, different delivery.
 - MAC changes on detach/re-attach. If your automation ever detaches and
   re-attaches a network, re-run the helper:
-  `python3 /usr/local/bin/privnet-namer.py` (Ubuntu) or
+  `python3 /usr/local/bin/privnet-namer.py` (Ubuntu, openSUSE/SLES) or
   `/usr/libexec/platform-python /usr/local/bin/privnet-namer.py` (RHEL).
 - The primary/public interface (`eth0`/`ens3`) is left alone. Only the private
   NICs listed in the config are touched.
 - The config reference above is for the unmanaged (API) variants. The managed
   variant's config is just `{ "subnet": "...", "name": "..." }` per network, with
   an optional `mtu` — no key, no zone, no UUIDs.
-- The managed variant re-runs safely: `/usr/libexec/platform-python
-  /usr/local/bin/privnet-namer.py`. It re-derives everything from the current
-  leases, so no state to keep in sync.
+- The managed variants re-run safely — verified on openSUSE, where a second run
+  on a fully configured instance changed nothing and kept every address. They
+  re-derive everything from the current leases, so there is no state to keep in
+  sync.
 
 ## Testing
 
-Both variants were booted verbatim (minus the placeholders) on Exoscale.
+Every variant was booted verbatim (minus the placeholders) on Exoscale.
 
 - **Ubuntu 24.04**, two unmanaged networks: interfaces came up as the configured
   names bound to the right networks, while the kernel had enumerated them as
@@ -248,6 +298,29 @@ Both variants were booted verbatim (minus the placeholders) on Exoscale.
   (`10.0.20.50`) with no API, key, metadata, or internet involved. Verified from
   inside the instance by relaying its state to an observer on the same private
   network (the instance itself has no outbound path). Also held across a reboot.
+- **openSUSE Leap 16.0, managed variant** (`de-fra-1`, public template
+  `OpenSUSE Leap 16.0 64-bit`), three managed networks — the customer setup:
+  `10.1.1.0/24` → `vnf_mgmt`, `10.1.3.0/24` → `sig_int`,
+  `10.1.5.0/24` → `oam_ne`.
+  - With `--public-ip none`: the kernel had enumerated the NICs `eth0`–`eth2`;
+    after cloud-init they were `vnf_mgmt`, `sig_int`, `oam_ne` with the right
+    lease on each. Verified through a jump host on the same private networks.
+  - Addresses then pinned with `instance private-network update-ip` to
+    `10.1.1.30` / `10.1.3.30` / `10.1.5.30` and rebooted: each interface kept
+    its name and picked up its pinned address.
+  - With a public IP: the private NICs were named the same way while `eth0`
+    kept its cloud-init profile, its default route and internet access. Held
+    across a reboot, and a manual re-run of the helper was a no-op.
+  - On an instance doctored to behave like an image that never DHCPs an
+    unclaimed NIC (`no-auto-default=*`, profiles deleted, addresses flushed,
+    links down), the helper started DHCP on all three NICs itself and named
+    them — the public NIC was left alone throughout. This is what makes the
+    file safe to hand to someone running a custom image rather than the stock
+    template.
+- **SLES 15 SP7** (`de-fra-1`, same three networks) was booted to check whether
+  it is the same system: it is not. wicked, no NetworkManager, no `nmcli`,
+  Python 3.6, and both private NICs left `device-unconfigured` with no address.
+  The helper printed its "NetworkManager is not running" guard and exited 1.
 
 The helper logs to the cloud-init output, so if something goes wrong:
 

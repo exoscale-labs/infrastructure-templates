@@ -44,6 +44,7 @@ Pick by whether your private networks are **managed**
 | **Managed** (RHEL/Rocky/Alma) | `cloud-init-rhel-managed.yaml` | DHCP lease subnet (local) | nothing |
 | **Managed** (Ubuntu/Debian) | `cloud-init-ubuntu-managed.yaml` | DHCP lease subnet (local) | nothing |
 | **Managed** (openSUSE Leap 16) | `cloud-init-suse-managed.yaml` | DHCP lease subnet (local) | nothing |
+| **Managed** (SUSE with wicked) | `cloud-init-suse-wicked.yaml` | DHCP lease subnet (local) | nothing |
 | Unmanaged (RHEL/Rocky/Alma) | `cloud-init-rhel.yaml` | API lookup by MAC | scoped API key + internet |
 | Unmanaged (Ubuntu/Debian) | `cloud-init-ubuntu.yaml` | API lookup by MAC | scoped API key + internet |
 
@@ -142,22 +143,54 @@ On the stock Leap 16 image it is harmless, because NetworkManager's auto-default
 still gives every unclaimed NIC a DHCP lease, so the instance is never left
 without addresses.
 
-**SLES 15 is a different system and is not covered by this file.** The Exoscale
-`SUSE Linux Enterprise Server 15 SP7` template still runs wicked, has no
-NetworkManager and no `nmcli`, and its Python is 3.6. There the private NICs
-stay `device-unconfigured` — attached, but without an address, so `ip -4 a` shows
-nothing but `lo` and `eth0`. The helper detects this and exits with an
-explanation instead of failing obscurely; a wicked system needs its own variant
-(ifcfg files plus `wicked ifup`).
+### SUSE with wicked
+
+Not every SUSE image is a NetworkManager image. The Exoscale
+`SUSE Linux Enterprise Server 15 SP7` template runs wicked, and so do golden
+images built on Leap that keep wicked. There is no `nmcli` at all, and the
+private NICs stay `device-unconfigured` — attached, but without an address, so
+`ip -4 a` shows nothing but `lo` and `eth0`. Which one you have:
+
+```bash
+systemctl is-active NetworkManager wicked
+```
+
+`cloud-init-suse-wicked.yaml` is that variant. Each helper refuses to run on the
+other's system and says which file to use instead, so picking the wrong one
+costs a log line, not a broken instance.
+
+Same three phases, different tools: it writes an `ifcfg-<iface>` per NIC and
+runs `wicked ifup` to get the leases (wicked configures nothing it was not
+asked to), maps subnet → MAC → name, then renames and writes
+`ifcfg-<name>`.
+
+Naming is where wicked images differ most, and both points were found by
+rebooting, not by reading:
+
+- The SLES image boots with `net.ifnames=0`, which makes udev **ignore the
+  `Name=` in a systemd `.link` file**. After a reboot the NICs are `eth1`,
+  `eth2`, … again. What does work is the classic SUSE udev rule with `NAME=`,
+  so the helper writes both and relies on the rule.
+- cloud-init writes its own `85-persistent-net-cloud-init.rules` pinning the
+  MAC of the NIC it configured to `eth0`, and SUSE images ship
+  `70-persistent-net.rules` doing the same. The last `NAME=` wins, so the
+  helper's file is a `99-` one and any line elsewhere claiming a MAC it renames
+  is removed (originals kept in `/var/log/privnet-namer/`). Without that, every
+  NIC renames except the first one.
+
+The temporary `ifcfg-eth1`, `ifcfg-eth2`, … are deliberately left behind. If a
+rename ever fails, the NIC still gets its lease under the kernel name and the
+instance stays reachable — which matters when it has no public IP and the
+alternative is the emergency console.
 
 ## Requirements
 
-- Ubuntu/Debian, RHEL/Rocky/Alma 8 or 9, or openSUSE Leap 16. Uses only what's
-  on the base image. (SLES 15 runs wicked — see above.)
+- Ubuntu/Debian, RHEL/Rocky/Alma 8 or 9, openSUSE Leap 16, or a SUSE image
+  running wicked (SLES 15). Uses only what's on the base image.
 - The private networks created ahead of time (you need their UUIDs).
 - A scoped API key (below).
 
-## Setup — managed variants (`cloud-init-rhel-managed.yaml`, `cloud-init-suse-managed.yaml`, `cloud-init-ubuntu-managed.yaml`)
+## Setup — managed variants (`cloud-init-rhel-managed.yaml`, `cloud-init-suse-managed.yaml`, `cloud-init-suse-wicked.yaml`, `cloud-init-ubuntu-managed.yaml`)
 
 No API key, no IAM role. Just edit the `networks` block: each managed network's
 subnet and the interface name you want.
@@ -317,10 +350,16 @@ Every variant was booted verbatim (minus the placeholders) on Exoscale.
     them — the public NIC was left alone throughout. This is what makes the
     file safe to hand to someone running a custom image rather than the stock
     template.
-- **SLES 15 SP7** (`de-fra-1`, same three networks) was booted to check whether
-  it is the same system: it is not. wicked, no NetworkManager, no `nmcli`,
-  Python 3.6, and both private NICs left `device-unconfigured` with no address.
-  The helper printed its "NetworkManager is not running" guard and exited 1.
+- **SLES 15 SP7, wicked variant** (`de-fra-1`, template
+  `SUSE Linux Enterprise Server 15 SP7`), three managed networks. With
+  `--public-ip none`: all three NICs got a lease from a stack that configures
+  nothing by itself, and came up as `vnf_mgmt`, `sig_int`, `oam_ne`. Addresses
+  then pinned to `.30` and rebooted — names and addresses held. With a public
+  IP: private NICs named, `eth0` kept its cloud-init config, default route and
+  internet, held across a reboot, and a manual re-run changed nothing.
+  Before the udev findings above were folded in, the same test left a
+  private-only instance unreachable after its first reboot; that is what the
+  `99-` rule and the conflict stripping fix.
 
 The helper logs to the cloud-init output, so if something goes wrong:
 

@@ -33,9 +33,9 @@ after the first few seconds the helper brings DHCP up itself (an image may have
 NetworkManager's auto-default turned off) instead of waiting for something that
 will never happen.
 
-Requires NetworkManager. SLES 15 and older openSUSE releases that still run
-wicked are not covered by this variant -- there the private NICs stay
-`device-unconfigured` and nmcli does not exist.
+Requires NetworkManager. SUSE images that still run wicked (SLES 15, and golden
+images built on Leap that keep it) have no nmcli and leave the private NICs
+`device-unconfigured`; use cloud-init-suse-wicked.yaml there.
 
 No extra packages required (python3, nmcli and udevadm are in the cloud image);
 it stays compatible with python 3.6 so the guard below can still report itself
@@ -258,8 +258,8 @@ def main():
         raise SystemExit(
             "NetworkManager is not running -- this variant is for openSUSE "
             "Leap 16 and other NetworkManager images. On a wicked system "
-            "(SLES 15) the private NICs stay device-unconfigured and nmcli "
-            "does not exist; that setup needs a wicked-based variant.")
+            "(SLES 15, or a golden image that kept wicked) use "
+            "cloud-init-suse-wicked.yaml instead.")
     cfg = json.load(open(CONFIG))
     networks = cfg["networks"]
     log("expecting %d managed private network(s)" % len(networks))
